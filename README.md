@@ -292,6 +292,180 @@ python main.py --full
 
 ---
 
+## API 服務
+
+### 啟動
+
+```powershell
+.venv\Scripts\python.exe -m uvicorn api_server:app --host 0.0.0.0 --port 8000
+```
+
+啟動時會依序載入嵌入模型、ChromaDB、LLM（約 30–60 秒），看到以下訊息即代表就緒：
+
+```
+[startup] All models ready. API is serving.
+```
+
+互動式文件（Swagger UI）可在瀏覽器開啟：`http://localhost:8000/docs`
+
+---
+
+### 端點
+
+#### `GET /health` — 健康檢查
+
+```bash
+curl http://localhost:8000/health
+```
+
+```json
+{
+  "status": "ok",
+  "collection": "ttas_guidelines",
+  "chunks": 320,
+  "model": "Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+}
+```
+
+---
+
+#### `POST /triage` — 病患檢傷分級
+
+**Request**（所有欄位除 `chief_complaint` 外皆可選填，缺值自動視為「不詳」）：
+
+```json
+{
+  "chief_complaint": "胸痛",
+  "birth_date": "1990-05-20",
+  "emergency_date": "2024-01-15",
+  "gender": "男",
+  "temperature": 36.8,
+  "systolic_bp": 88,
+  "diastolic_bp": 60,
+  "pulse": 118,
+  "respiration": 26,
+  "sao2": 91,
+  "gcs_e": 4,
+  "gcs_v": 5,
+  "gcs_m": 6,
+  "height": 170.0,
+  "weight": 65.0,
+  "pupil_left": "+",
+  "pupil_right": "-"
+}
+```
+
+| 欄位 | 型態 | 說明 |
+|---|---|---|
+| `chief_complaint` | string（**必填**） | 病人主訴 |
+| `age` | int | 年齡（歲），直接給時優先使用 |
+| `birth_date` | string | 生日，支援西元（`1990-05-20`）或民國（`079/05/20`）格式 |
+| `emergency_date` | string | 急診日期，支援西元或民國格式；不填預設為今日 |
+| `gender` | string | 性別（男 / 女） |
+| `temperature` | float | 體溫（°C） |
+| `systolic_bp` | float | 收縮壓（mmHg） |
+| `diastolic_bp` | float | 舒張壓（mmHg） |
+| `pulse` | float | 脈搏（次/分） |
+| `respiration` | float | 呼吸頻率（次/分） |
+| `sao2` | float | 血氧飽和度（%） |
+| `gcs_e` | int | GCS 睜眼（1–4） |
+| `gcs_v` | int | GCS 語言（1–5） |
+| `gcs_m` | int | GCS 運動（1–6） |
+| `height` | float | 身高（cm） |
+| `weight` | float | 體重（kg） |
+| `pupil_left` | string | 左瞳孔光反應：`+`（有）、`-`（無）、`+C`（白內障手術史），或含大小如 `3+` |
+| `pupil_right` | string | 右瞳孔光反應，同上 |
+
+> **年齡與分組**：系統從 `birth_date` + `emergency_date` 自動計算年齡，並依「< 18 歲 → 兒童 TTAS；≥ 18 歲 → 成人 TTAS」決定適用標準。兒童與成人的生命徵象正常值不同，分群對 RAG 檢索與 LLM 判斷均有影響。
+
+**Response**：
+
+```json
+{
+  "triage_level": 2,
+  "parse_success": true,
+  "raw_response": "2",
+  "age_computed": 33,
+  "is_pediatric": false,
+  "query": "主訴：胸痛。年齡：33歲（成人）。性別：男。...",
+  "retrieved_chunks": [
+    "【主訴】胸痛（大分類：A04心臟血管）\n判定依據 → TTAS級數：\n- 休克 → 1級\n...",
+    "..."
+  ]
+}
+```
+
+| 欄位 | 型態 | 說明 |
+|---|---|---|
+| `triage_level` | int | TTAS 等級 1–5；解析失敗時為 -1 |
+| `parse_success` | bool | LLM 輸出是否成功解析為有效等級 |
+| `raw_response` | string | LLM 原始輸出（供除錯） |
+| `age_computed` | int \| null | 系統計算後的年齡；無法計算時為 null |
+| `is_pediatric` | bool | 是否適用兒童 TTAS 標準（< 18 歲） |
+| `query` | string | 實際送入 RAG + LLM 的查詢字串 |
+| `retrieved_chunks` | string[] | RAG 取回的 TTAS 指引片段（預設 Top-5） |
+
+**curl 範例（成人）**：
+
+```bash
+curl -X POST http://localhost:8000/triage \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chief_complaint": "呼吸困難",
+    "birth_date": "1975-03-10",
+    "emergency_date": "2024-08-20",
+    "gender": "女",
+    "sao2": 88,
+    "pulse": 130,
+    "respiration": 32,
+    "pupil_left": "+",
+    "pupil_right": "+"
+  }'
+```
+
+**curl 範例（兒童，民國生日）**：
+
+```bash
+curl -X POST http://localhost:8000/triage \
+  -H "Content-Type: application/json" \
+  -d '{
+    "chief_complaint": "發燒抽搐",
+    "birth_date": "112/06/15",
+    "emergency_date": "113/08/20",
+    "weight": 14.5,
+    "temperature": 39.8,
+    "gcs_e": 3,
+    "gcs_v": 3,
+    "gcs_m": 5
+  }'
+```
+
+**Python 範例**：
+
+```python
+import requests
+
+resp = requests.post("http://localhost:8000/triage", json={
+    "chief_complaint": "發燒抽搐",
+    "birth_date": "112/06/15",
+    "emergency_date": "113/08/20",
+    "weight": 14.5,
+    "temperature": 39.8,
+    "gcs_e": 3, "gcs_v": 3, "gcs_m": 5,
+})
+data = resp.json()
+print(f"年齡：{data['age_computed']} 歲（{'兒童' if data['is_pediatric'] else '成人'}）")
+print(f"檢傷等級：{data['triage_level']} 級")
+```
+
+---
+
+### 並發說明
+
+LLM 推理為 CPU/GPU 序列操作（非執行緒安全），伺服器內部以 `threading.Lock()` 確保同時只有一筆請求在推理。高並發場景建議在前端加 queue 或水平擴展多個 server 實例。
+
+---
+
 ## 重要技術備註
 
 | 問題 | 解法 |

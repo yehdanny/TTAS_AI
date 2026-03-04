@@ -20,5 +20,9 @@ chromadb==1.0.21
 # pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124 
 
 # GPU 版 llama-cpp-python（CUDA 12.4 預編譯 wheel，需另行安裝）
-# $env:CMAKE_ARGS = "-DGGML_CUDA=on" 
+# $env:CMAKE_ARGS = "-DGGML_CUDA=on"
 # pip install llama-cpp-python --no-cache-dir --force-reinstall
+
+# API 服務
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
