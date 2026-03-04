@@ -1,0 +1,51 @@
+# === 虛擬環境 ===
+.venv/
+venv/
+env/
+
+# === 大型模型檔（數 GB，不入版控）===
+model/
+
+# === 生成的向量索引（可由 build_rag.py 重建）===
+data/chroma_db/
+
+# === 病患資料（敏感資料，不入版控）===
+data/patient_data/
+
+# === 推理結果（可重跑生成）===
+results/
+
+# === Python 編譯快取 ===
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# === 套件建置產物 ===
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+
+# === 環境變數 / 金鑰 ===
+.env
+.env.*
+secrets.*
+
+# === 編輯器 / IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# === OS 產生的雜檔 ===
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# === 臨時 / 測試輸出 ===
+tmp_*.txt
+*.log
