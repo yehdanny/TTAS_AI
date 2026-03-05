@@ -22,10 +22,13 @@ TTAS/
 ├── README.md
 ├── requirements.txt             # 套件清單（不含 torch / llama-cpp-python）
 │
-├── build_rag.py                 # 索引建立 v2（PDF → 以主訴為單位 chunk）★ 推薦
+├── build_rag.py                 # 索引建立 v2（PDF → 以主訴為單位 chunk）
 ├── build_rag_v3.py              # 索引建立 v3（手動 Python chunks 匯入）
-├── main.py                      # 推理評估（對應 v2 索引）★ 推薦
-├── main_v3.py                   # 推理評估（對應 v3 索引）
+├── main.py                      # 推理評估 v2（基準版）
+├── main_v3.py                   # 推理評估 v3（手動 chunks）
+├── main_v4.py                   # 推理評估 v4（加入年齡/身高體重/瞳孔）
+├── main_v5.py                   # 推理評估 v5（兩階段 RAG + 年齡 source 過濾）★ 推薦
+├── main_v6.py                   # 推理評估 v6（CoT + few-shot + Top-5 + 有值欄位 query）
 │
 ├── data/
 │   ├── rag_knowledge/           # 8 份 TTAS 官方 PDF 指引（知識庫來源）
@@ -59,6 +62,9 @@ TTAS/
     ├── confusion_matrix.png
     ├── metrics_report.txt
     └── per_level_metrics.csv
+├── results_v4/               # v4 推理結果（main_v4.py，含年齡/體重/瞳孔欄位）
+├── results_v5/               # v5 推理結果（main_v5.py，兩階段 RAG）
+└── results_v6/               # v6 推理結果（main_v6.py，CoT + few-shot）
 ```
 
 ---
@@ -172,59 +178,115 @@ python main.py --full
 
 ---
 
-## 實驗結果比較
+## 版本演進概覽
 
-所有版本均使用相同條件：分層抽樣 350 筆（各級各 70 筆）、Qwen3-4B-Instruct GGUF、BGE-M3 嵌入、Top-5 檢索。
+### RAG Index 版本
 
-### 整體指標
+| Index | 說明 | Collection |
+|---|---|---|
+| `build_rag.py` (v2) | 以主訴為單位結構化 chunk | `ttas_guidelines`（320 chunks）|
+| `build_rag_v3.py` | 手動精選 Python chunk | `ttas_v3`（318 chunks）|
+| `build_rag_v7.py` | v7+ 使用，embed_text 只用「主訴名稱」，code prefix 清除 | `ttas_v7` |
 
-| 指標 | v1（硬切 400 字） | v2（主訴結構化）★ | v3（手動精選） |
-|---|:---:|:---:|:---:|
-| **Accuracy** | 52.86% | **55.71%** | 51.71% |
-| **Adjacent Accuracy** | **93.43%** | 90.57% | 92.86% |
-| **Linear Kappa** | 0.6313 | **0.6344** | 0.6201 |
-| Parse Failure | 0/350 | 0/350 | 0/350 |
+### 推理版本說明
 
-### 各級 F1
-
-| Level | v1 硬切 | v2 主訴結構化 ★ | v3 手動精選 |
-|---|:---:|:---:|:---:|
-| Lv1（復甦急救） | 0.762 | **0.702** | 0.648 |
-| Lv2（危急） | 0.580 | 0.576 | **0.579** |
-| Lv3（緊急） | 0.441 | 0.449 | **0.450** |
-| Lv4（次緊急） | 0.373 | **0.410** | 0.310 |
-| Lv5（非緊急） | 0.515 | **0.661** | 0.598 |
+| 版本 | 核心改動 |
+|---|---|
+| `main.py` (v2) | 主訴結構化 chunk，全 pool 檢索，基準版 |
+| `main_v3.py` | 手動精選 chunk |
+| `main_v4.py` | 加入年齡/身高體重/瞳孔欄位 |
+| `main_v5.py` | 兩階段 RAG（年齡 source 過濾 + ★ 觸發總表） |
+| `main_v6.py` | CoT 推理 + few-shot + Top-5 + 有值欄位 query |
+| `main_v7.py` | RAG query 只用病人主訴；LLM 選條目再 rule 抽等級；Stage2 次要調節 |
+| `main_v8.py` | Top-5 RAG + LLM Reranking（繼承 v7 index） |
+| `main_v9.py` | EXACT substring match 主訴名稱 → 優先跳過 RAG；fallback RAG+Rerank |
+| `main_v10.py` | [B] Vital pre-filter; [C] 有據才選 prompt; [D] EXACT 多命中 reranking |
+| `main_v11.py` | [E] 全面 Vitals Assessment + 雙軌制 (vital_min ∩ LLM); [F] 標注; [G][H] |
+| `main_v12.py` | [I] 依官方 TTAS 成人/兒童標準文件寫死閾值，兒童 HR 依年齡精確分段 |
+| `main_v14.py` ★ | [L] 成人 Temp>38 規則修正（移除假陽性）; [M] MOI 關鍵字偵測第三軌; [N] SYSTEM_SELECTION 提示詞強化; [O] 疼痛分數動態支援 |
 
 ---
 
-## 版本選擇結論
+## 實驗結果比較（350 筆分層抽樣，各級 70 筆）
 
-**推薦使用 v2（`build_rag.py` + `main.py`）**。
+各版本使用 Qwen3-4B-Instruct GGUF + BGE-M3 嵌入，random_state=42。
 
-### 理由
+| 指標 | v1 硬切 | v2 主訴結構化 | v9 EXACT | v10 | v12 官方閾值 | **v14 ★** |
+|---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Accuracy** | 52.86% | 55.71% | 50.00% | 50.00% | 53.43% | **54.57%** |
+| **Adjacent Acc** | 93.43% | 90.57% | 90.57% | 91.14% | 89.14% | **90.29%** |
+| **Kappa** | 0.6313 | 0.6344 | 0.5865 | 0.5939 | 0.6184 | **0.6384** |
 
-**v2 在大多數指標上表現最好：**
-- Accuracy 55.71%，是三版最高，較 v1 提升 +2.85%、較 v3 提升 +4.00%
-- Linear Kappa 0.6344 最高，達到 Substantial agreement 水準
-- Lv4 F1（0.410 vs v1 的 0.373、v3 的 0.310）與 Lv5 F1（0.661 vs v1 的 0.515、v3 的 0.598）改善最顯著
+> v5 僅完成全量推理（9653 筆）：Accuracy 42.77%、Adjacent 94.35%、Kappa 0.2606。v13 因 shock proxy 過鬆導致 Lv1/Lv2 混淆，效果不如 v12，未列入。
 
-**v3 手動 chunks 的侷限：**
-- Lv4（次緊急）F1 僅 0.310，是三版最差。手動 chunk 的 `query_text` 為精簡關鍵詞，次緊急案例主訴語意模糊時 RAG 難以精準匹配
-- 整體 Accuracy 反而比 v1 更低，顯示人工整理的格式不一定優於從原始 PDF 結構化提取
+### 各級 F1（v12 vs v14）
 
-**v1 的問題：**
-- 硬切破壞表格結構，同一主訴的判定依據被拆散到不同 chunk，導致 Lv5 F1 特別低（0.515）
-- Accuracy 和 Kappa 均弱於 v2
+| Level | v12 | **v14 ★** | 疼痛驅動案例占比 |
+|---|:---:|:---:|:---:|
+| Lv1（復甦急救） | 0.861 | **0.867** | 2.0% |
+| Lv2（危急） | 0.564 | **0.600** | 27.5% |
+| Lv3（緊急） | 0.372 | **0.378** | 41.8% |
+| Lv4（次緊急） | 0.338 | **0.364** | 94.6% |
+| Lv5（非緊急） | 0.504 | 0.500 | 94.7% |
 
-**v3 的唯一優勢：**
-- Adjacent Accuracy 92.86%，略高於 v2 的 90.57%，表示 v3 的預測誤差更集中在相鄰一級。若臨床應用中「預測偏一級」可接受，v3 也是合理選擇
+> 「疼痛驅動案例」= 該等級中以 TTAS 疼痛標準主訴分類的案例比例（全資料集 9,653 筆統計）。
+> Lv4/Lv5 幾乎全由疼痛程度決定；現有 CSV 無疼痛分數欄位，為 Lv3/Lv4 F1 偏低的主因。
 
-### 如需進一步改善
+---
 
-目前瓶頸在 Lv3（緊急）F1 約 0.45，是最難分辨的類別，Lv4 其次。可考慮：
-1. 增加 Top-K 從 5 提升至 7–10（較多參考指引）
-2. 在 Prompt 中加入更明確的生命徵象判斷規則（如具體呼吸次數、血壓閾值）
-3. 針對 Lv3/Lv4 易混淆對（緊急 vs 次緊急）設計專屬的 re-ranking 或 fallback 機制
+## 關鍵架構（v7+）
+
+```
+病患主訴 + 生命徵象
+    │
+    ├─ [Rule-based Vital 軌]
+    │      assess_vitals() → VitalAlert 清單
+    │      vital_min_level = min(alert.min_level)
+    │
+    └─ [LLM RAG 軌]
+           EXACT match 主訴名稱
+             │ 命中 → 直接取 chunk（多命中 → Rerank）
+             │ 未命中 → RAG Top-5 → Rerank
+           filter_criteria_by_vitals()   # 過濾明顯不適用條目
+           constrain_criteria_by_vital_level()  # 強制限縮選項
+           LLM 選條目 → rule 抽等級
+           ★ → Stage2（次要調節變數）
+           llm_level
+    │
+    ▼
+final_level = min(vital_min_level, llm_level)
+```
+
+### 官方閾值對照（v14）
+
+**成人**（`成人判斷標準.txt`）：
+
+| 指標 | 1級 | 2級 | 3級 | 4級 |
+|---|---|---|---|---|
+| SBP | <70 | <90 | ≥220 | 200~220 |
+| MAP | — | <65 | — | — |
+| DBP | — | — | ≥130 | 110~130 |
+| SpO2 | <90% | <92% | 92~94% | — |
+| RR | <10 | — | — | — |
+| HR | (<50 or >140) **AND** SBP<70 | <50 or >140 | — | — |
+| Temp | >41 or <32 | 32~35（低體溫）† | — | — |
+| GCS | 3~8 | 9~13 | — | — |
+
+> † TTAS 原文 Temp>38°C → 2 級需同時符合「免疫功能缺陷」或「SIRS ≥3 項」，純數值無法判定，v14 起移除自動觸發。>
+
+**兒童**（`小兒判斷標準.txt`）：
+
+| 指標 | 1級 | 2級 |
+|---|---|---|
+| SBP | <70（>1歲） | — |
+| SpO2 | <90% | <92% |
+| RR | <10 | — |
+| HR <3月 | <90 or ≥190 | <110 or ≥170 |
+| HR 3月~3歲 | <80 or ≥170 | <90 or ≥150 |
+| HR >3歲 | <50 or ≥150 | <60 or ≥130 |
+| Temp <3月 | >41 or <32 | >38 or 32~36 |
+| Temp ≥3月 | >41 or <32 | 32~35 |
+| GCS | 3~8 | 9~13 |
 
 ---
 
