@@ -1,0 +1,580 @@
+"""
+main_v6.py
+Step 2 (v6): CoT 推理 + few-shot 範例 + 擴大 Top-K + query 只保留有值欄位。
+
+執行方式：
+    python main_v6.py
+"""
+
+import matplotlib
+
+matplotlib.use("Agg")  # 無顯示器環境，必須在 import pyplot 前設定
+
+import os
+import re
+import csv
+import sys
+import warnings
+from datetime import date
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import (
+    accuracy_score,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    cohen_kappa_score,
+)
+from sentence_transformers import SentenceTransformer
+import chromadb
+from llama_cpp import Llama
+
+warnings.filterwarnings("ignore")
+
+# ── 路徑設定 ──────────────────────────────────────────────────────────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_PATH = os.path.join(BASE_DIR, "data", "patient_data", "total_data.xls")
+CHROMA_DIR = os.path.join(BASE_DIR, "data", "chroma_db")
+MODEL_PATH = os.path.join(BASE_DIR, "model", "Qwen3-4B-Instruct-2507-Q4_K_M.gguf")
+RESULTS_DIR = os.path.join(BASE_DIR, "results_v6")
+
+# ── 參數 ───────────────────────────────────────────────────────────────────────
+EMBED_MODEL = "BAAI/bge-m3"
+COLLECTION_NAME = "ttas_v3"  # ttas_guidelines"
+INSTRUCTION_PREFIX = "为这个句子生成表示以用于检索相关文章："
+SAMPLE_PER_LEVEL = 70
+RANDOM_STATE = 42
+
+# ── 兩階段 RAG 參數 ────────────────────────────────────────────────────────────
+PEDIATRIC_AGE_CUTOFF = 18
+
+# Stage 1：主訴 chunk（依年齡分組，不含總表）
+N_RETRIEVAL_COMPLAINT = 5
+ADULT_COMPLAINT_SOURCES = ["外傷", "成人非外傷", "環境"]
+PEDIATRIC_COMPLAINT_SOURCES = ["外傷", "兒童", "環境"]
+ALL_COMPLAINT_SOURCES = ["外傷", "成人非外傷", "兒童", "環境"]  # 年齡不詳時
+
+# Stage 2：次要調節變數（只有主訴 chunk 含 ★ 時才觸發）
+N_RETRIEVAL_REFERENCE = 2
+REFERENCE_SOURCES = ["總表", "總表(第二次修正)"]
+
+SYSTEM_PROMPT = """\
+你是一位台灣急診室的資深檢傷護理師，專精於TTAS（台灣急診五級檢傷分類制度）。
+
+【參考指引說明】
+提供給你的參考指引已依病患年齡預先篩選（成人版或兒童版），直接使用即可。
+若參考指引後段附有次要調節變數規則，表示本案例需要套用，請參照後決定最終級數。
+
+【判定步驟】
+1. 從參考指引中找到與病患主訴最匹配的判定依據與 TTAS 級數。
+2. 若該判定依據標有「★」，次要調節變數規則已附於參考指引後段，直接套用並決定最終級數。
+3. 若無「★」，直接輸出查到的 TTAS 級數。
+
+【各級定義】
+第1級（復甦急救）：生命徵象極不穩定，需立即搶救，如心跳停止、呼吸停止、嚴重休克。
+第2級（危急）：生命徵象不穩定，有立即生命危險，需在10分鐘內處置。
+第3級（緊急）：生命徵象尚穩定，但症狀明顯，需在30分鐘內處置。
+第4級（次緊急）：生命徵象穩定，輕度不適，可在60分鐘內處置。
+第5級（非緊急）：生命徵象穩定，非急性或慢性問題，可在120分鐘內處置。
+
+【常見邊界判斷範例】
+• 血氧90-92%（中度呼吸窘迫）或血行動力循環不足 → 第2級
+• 血氧92-94%（輕度呼吸窘迫）且血行動力穩定 → 第3級
+• 意識GCS 9-13（意識程度改變）→ 第2級；GCS 14-15 → 視其他指標
+• 急性重度疼痛（8-10分）→ 第3級；急性中度疼痛（4-7分）→ 第4級；輕度疼痛（<4分）→ 第5級
+• 生命徵象異常但血行動力穩定 → 第3級（非第2級）
+
+最終答案只輸出一個阿拉伯數字（1–5）。"""
+
+USER_TEMPLATE = """\
+【病人資料】
+{query}
+
+【TTAS參考指引】
+{context}
+
+根據以上資料，此病人的檢傷等級為幾級？
+請只輸出數字1、2、3、4或5："""
+
+
+# ── 工具函式 ──────────────────────────────────────────────────────────────────
+def safe_val(val, default="不詳") -> str:
+    """將 NaN / None / 空白值轉為預設字串。"""
+    if pd.isna(val):
+        return default
+    s = str(val).strip()
+    return s if s else default
+
+
+def _parse_yyyymmdd(val) -> "date | None":
+    """將 YYYYMMDD 整數（如 20251001）轉為 date；失敗回傳 None。"""
+    try:
+        s = str(int(val))
+        if len(s) == 8:
+            return date(int(s[:4]), int(s[4:6]), int(s[6:8]))
+    except (ValueError, TypeError):
+        pass
+    return None
+
+
+def _calc_age(birth_val, emergency_val) -> "int | None":
+    """從 YYYYMMDD 欄位計算年齡（歲）。"""
+    bd = _parse_yyyymmdd(birth_val)
+    ed = _parse_yyyymmdd(emergency_val)
+    if bd is None or ed is None:
+        return None
+    age = ed.year - bd.year - ((ed.month, ed.day) < (bd.month, bd.day))
+    return max(age, 0)
+
+
+GENDER_MAP = {"M": "男", "F": "女", "m": "男", "f": "女"}
+
+
+def build_query(row: pd.Series) -> str:
+    """從病患資料列建立查詢字串（v6：只輸出有值欄位，減少「不詳」噪音）。"""
+    parts = []
+
+    # 主訴（必填）
+    parts.append(f"主訴：{safe_val(row.get('病人主訴', np.nan))}")
+
+    # 年齡與分組
+    age = _calc_age(row.get("生日"), row.get("急診日期"))
+    if age is not None:
+        group = "兒童" if age < PEDIATRIC_AGE_CUTOFF else "成人"
+        parts.append(f"年齡：{age}歲（{group}）")
+
+    # 性別
+    gender_raw = safe_val(row.get("性別", np.nan))
+    if gender_raw != "不詳":
+        parts.append(f"性別：{GENDER_MAP.get(gender_raw, gender_raw)}")
+
+    # 生命徵象：只附有值的欄位
+    for field, label, unit in [
+        ("體溫", "體溫", "°C"),
+        ("收縮壓", "收縮壓", "mmHg"),
+        ("舒張壓", "舒張壓", "mmHg"),
+        ("脈搏", "脈搏", "次/分"),
+        ("呼吸", "呼吸", "次/分"),
+        ("SAO2", "血氧", "%"),
+    ]:
+        v = safe_val(row.get(field, np.nan))
+        if v != "不詳":
+            parts.append(f"{label}：{v}{unit}")
+
+    # GCS：三項皆缺才省略
+    all_gcs_missing = (
+        pd.isna(row.get("GCS_E"))
+        and pd.isna(row.get("GCS_V"))
+        and pd.isna(row.get("GCS_M"))
+    )
+    if not all_gcs_missing:
+        try:
+            gcs = int(
+                float(row.get("GCS_E") or 0)
+                + float(row.get("GCS_V") or 0)
+                + float(row.get("GCS_M") or 0)
+            )
+            parts.append(f"GCS：{gcs}")
+        except (TypeError, ValueError):
+            pass
+
+    # 身高 / 體重
+    for field, label, unit in [("身高", "身高", "cm"), ("體重", "體重", "kg")]:
+        v = safe_val(row.get(field, np.nan))
+        if v != "不詳":
+            parts.append(f"{label}：{v}{unit}")
+
+    # 瞳孔：至少一側有值才附加
+    pl = safe_val(row.get("瞳孔左", np.nan))
+    pr = safe_val(row.get("瞳孔右", np.nan))
+    if pl != "不詳" or pr != "不詳":
+        parts.append(f"瞳孔：左{pl}，右{pr}")
+
+    return "。".join(parts) + "。"
+
+
+def parse_response(text: str) -> int:
+    """
+    從 LLM 輸出中解析檢傷等級（1–5）。
+    無法解析回傳 -1。
+    """
+    # 1. 移除 <think>...</think> 殘留（Qwen3 思考模式未完全關閉時）
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
+    text = text.strip()
+
+    # 2. 比對「第X級」（中文序數）
+    cn_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5}
+    m = re.search(r"第([一二三四五1-5])級", text)
+    if m:
+        c = m.group(1)
+        return cn_map.get(c, int(c) if c.isdigit() else -1)
+
+    # 3. 比對獨立數字 \b[1-5]\b
+    m = re.search(r"\b([1-5])\b", text)
+    if m:
+        return int(m.group(1))
+
+    # 4. 最寬鬆 fallback：任意 [1-5]
+    m = re.search(r"[1-5]", text)
+    if m:
+        return int(m.group())
+
+    return -1  # 無法解析
+
+
+def is_pediatric_from_row(row: pd.Series) -> "bool | None":
+    """從資料列判斷是否為兒童；年齡無法計算時回傳 None。"""
+    age = _calc_age(row.get("生日"), row.get("急診日期"))
+    if age is None:
+        return None
+    return age < PEDIATRIC_AGE_CUTOFF
+
+
+def retrieve_context(
+    query: str,
+    embedder: SentenceTransformer,
+    collection,
+    is_pediatric: "bool | None" = None,
+) -> "tuple[str, bool]":
+    """
+    兩階段 RAG 檢索。
+
+    Stage 1：依年齡從主訴 sources 取 Top-3 chunk。
+    Stage 2：若 Stage 1 結果含 ★，再對總表 sources 取 Top-2 chunk。
+
+    回傳 (context_str, star_triggered)。
+    """
+    prefixed = f"{INSTRUCTION_PREFIX}{query}"
+    embedding = embedder.encode(prefixed, normalize_embeddings=True).tolist()
+
+    # Stage 1 — 主訴 chunk
+    if is_pediatric is None:
+        complaint_sources = ALL_COMPLAINT_SOURCES
+    elif is_pediatric:
+        complaint_sources = PEDIATRIC_COMPLAINT_SOURCES
+    else:
+        complaint_sources = ADULT_COMPLAINT_SOURCES
+
+    stage1 = collection.query(
+        query_embeddings=[embedding],
+        n_results=N_RETRIEVAL_COMPLAINT,
+        where={"source": {"$in": complaint_sources}},
+    )
+    docs = stage1["documents"][0]
+
+    # Stage 2 — 次要調節變數（條件觸發）
+    star_triggered = any("★" in doc for doc in docs)
+    if star_triggered:
+        stage2 = collection.query(
+            query_embeddings=[embedding],
+            n_results=N_RETRIEVAL_REFERENCE,
+            where={"source": {"$in": REFERENCE_SOURCES}},
+        )
+        docs = docs + stage2["documents"][0]
+
+    return "\n---\n".join(docs), star_triggered
+
+
+# ── 評估輸出 ──────────────────────────────────────────────────────────────────
+def plot_confusion_matrix(y_true: list, y_pred: list, save_path: str):
+    """繪製原始次數 + 列正規化百分比雙圖並排混淆矩陣。"""
+    labels = [1, 2, 3, 4, 5]
+    cm = confusion_matrix(y_true, y_pred, labels=labels)
+    cm_norm = cm.astype(float) / cm.sum(axis=1, keepdims=True)
+    cm_norm = np.nan_to_num(cm_norm)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # 原始次數
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=labels,
+        yticklabels=labels,
+        ax=axes[0],
+    )
+    axes[0].set_title("Confusion Matrix (Counts)")
+    axes[0].set_xlabel("Predicted Level")
+    axes[0].set_ylabel("True Level")
+
+    # 列正規化百分比
+    sns.heatmap(
+        cm_norm,
+        annot=True,
+        fmt=".2f",
+        cmap="Oranges",
+        xticklabels=labels,
+        yticklabels=labels,
+        ax=axes[1],
+        vmin=0,
+        vmax=1,
+    )
+    axes[1].set_title("Confusion Matrix (Row-Normalized %)")
+    axes[1].set_xlabel("Predicted Level")
+    axes[1].set_ylabel("True Level")
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"Confusion matrix saved: {save_path}")
+
+
+def compute_metrics(y_true: list, y_pred: list):
+    """計算並回傳各項評估指標。"""
+    valid_mask = [p != -1 for p in y_pred]
+    y_true_v = [y for y, m in zip(y_true, valid_mask) if m]
+    y_pred_v = [p for p, m in zip(y_pred, valid_mask) if m]
+
+    n_total = len(y_true)
+    n_valid = len(y_true_v)
+    n_failed = n_total - n_valid
+
+    accuracy = accuracy_score(y_true_v, y_pred_v) if y_true_v else 0.0
+
+    adj_correct = sum(abs(t - p) <= 1 for t, p in zip(y_true_v, y_pred_v))
+    adjacent_accuracy = adj_correct / n_valid if n_valid else 0.0
+
+    kappa = (
+        cohen_kappa_score(y_true_v, y_pred_v, weights="linear")
+        if len(set(y_true_v)) > 1
+        else 0.0
+    )
+
+    labels = [1, 2, 3, 4, 5]
+    precision, recall, f1, support = precision_recall_fscore_support(
+        y_true_v, y_pred_v, labels=labels, zero_division=0
+    )
+
+    return {
+        "n_total": n_total,
+        "n_valid": n_valid,
+        "n_parse_failed": n_failed,
+        "accuracy": accuracy,
+        "adjacent_accuracy": adjacent_accuracy,
+        "kappa": kappa,
+        "labels": labels,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "support": support,
+    }
+
+
+def save_metrics_report(metrics: dict, save_path: str):
+    """將評估指標寫入文字報告。"""
+    lines = [
+        "=" * 60,
+        "TTAS 檢傷分級 LLM 評估報告",
+        "=" * 60,
+        f"總樣本數   : {metrics['n_total']}",
+        f"有效預測數 : {metrics['n_valid']}",
+        f"解析失敗數 : {metrics['n_parse_failed']}",
+        "",
+        f"Accuracy          : {metrics['accuracy']:.4f}",
+        f"Adjacent Accuracy : {metrics['adjacent_accuracy']:.4f}  (|true-pred| <= 1)",
+        f"Linear Kappa      : {metrics['kappa']:.4f}",
+        "",
+        "─" * 40,
+        "各級指標（僅計有效預測）：",
+        f"{'Level':>6}  {'Precision':>10}  {'Recall':>8}  {'F1':>8}  {'Support':>8}",
+    ]
+    for i, lv in enumerate(metrics["labels"]):
+        lines.append(
+            f"  Lv{lv}   {metrics['precision'][i]:>10.4f}  "
+            f"{metrics['recall'][i]:>8.4f}  "
+            f"{metrics['f1'][i]:>8.4f}  "
+            f"{int(metrics['support'][i]):>8d}"
+        )
+    lines.append("=" * 60)
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+
+    print(f"Metrics report saved: {save_path}")
+    try:
+        print("\n".join(lines))
+    except UnicodeEncodeError:
+        print("\n".join(lines).encode("ascii", errors="replace").decode("ascii"))
+
+
+def save_per_level_csv(metrics: dict, save_path: str):
+    """儲存各級指標 CSV。"""
+    rows = []
+    for i, lv in enumerate(metrics["labels"]):
+        rows.append(
+            {
+                "level": lv,
+                "precision": metrics["precision"][i],
+                "recall": metrics["recall"][i],
+                "f1": metrics["f1"][i],
+                "support": int(metrics["support"][i]),
+            }
+        )
+    pd.DataFrame(rows).to_csv(save_path, index=False, encoding="utf-8-sig")
+    print(f"Per-level metrics saved: {save_path}")
+
+
+# ── 主流程 ────────────────────────────────────────────────────────────────────
+def main():
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    # ── 1. 載入資料並分層抽樣 ────────────────────────────────────────────────
+    print(f"Loading patient data: {DATA_PATH}")
+    df = pd.read_excel(DATA_PATH, engine="xlrd")
+    print(f"Total records: {len(df)}")
+    print(f"Columns: {list(df.columns)}")
+
+    # 找出檢傷分級欄位（可能有空格或不同命名）
+    triage_col = None
+    for col in df.columns:
+        if "檢傷" in col and "分級" in col:
+            triage_col = col
+            break
+    if triage_col is None:
+        raise ValueError("找不到「檢傷分級」欄位，請確認 Excel 欄位名稱。")
+
+    print(f"Triage column: '{triage_col}'")
+
+    # 確保分級欄位為整數，過濾無效值
+    df[triage_col] = pd.to_numeric(df[triage_col], errors="coerce")
+    df = df[df[triage_col].isin([1, 2, 3, 4, 5])].copy()
+    df[triage_col] = df[triage_col].astype(int)
+    print(f"Records after filtering valid triage levels: {len(df)}")
+    print(f"Level distribution:\n{df[triage_col].value_counts().sort_index()}")
+
+    FULL_RUN = "--full" in sys.argv
+    if FULL_RUN:
+        sample = df.reset_index(drop=True)
+        print(f"\nFull run: using all {len(sample)} records.")
+    else:
+        sample = (
+            df.groupby(triage_col, group_keys=False)
+            .apply(
+                lambda x: x.sample(
+                    n=min(SAMPLE_PER_LEVEL, len(x)), random_state=RANDOM_STATE
+                )
+            )
+            .reset_index(drop=True)
+        )
+        print(f"\nSampled {len(sample)} records ({SAMPLE_PER_LEVEL} per level).")
+
+    # ── 2. 載入嵌入模型 ───────────────────────────────────────────────────────
+    print(f"\nLoading embedding model: {EMBED_MODEL}")
+    embedder = SentenceTransformer(EMBED_MODEL)
+    print("Embedding model loaded.")
+
+    # ── 3. 載入 ChromaDB ──────────────────────────────────────────────────────
+    print(f"Loading ChromaDB from: {CHROMA_DIR}")
+    client = chromadb.PersistentClient(path=CHROMA_DIR)
+    collection = client.get_collection(name=COLLECTION_NAME)
+    chunk_count = collection.count()
+    print(f"ChromaDB loaded: {chunk_count} chunks")
+
+    # ── 4. 載入 LLM ───────────────────────────────────────────────────────────
+    print(f"\nLoading LLM: {MODEL_PATH}")
+    llm = Llama(
+        model_path=MODEL_PATH,
+        n_gpu_layers=-1,  # 全部 offload 到 GPU
+        n_ctx=4096,
+        n_batch=512,
+        n_threads=4,
+        verbose=False,
+        seed=42,
+    )
+    print("LLM loaded.")
+
+    # ── 5. 推理迴圈 ───────────────────────────────────────────────────────────
+    y_true = []
+    y_pred = []
+    records = []
+
+    print(f"\nStarting inference on {len(sample)} samples...\n")
+
+    for idx, (_, row) in enumerate(sample.iterrows()):
+        true_level = int(row[triage_col])
+        is_ped = is_pediatric_from_row(row)
+        query = build_query(row)
+        context, star_triggered = retrieve_context(query, embedder, collection, is_ped)
+
+        user_msg = USER_TEMPLATE.format(query=query, context=context)
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_msg},
+        ]
+
+        response = llm.create_chat_completion(
+            messages=messages,
+            temperature=0.1,
+            max_tokens=512,
+            top_p=0.9,
+            repeat_penalty=1.1,
+        )
+        raw = response["choices"][0]["message"]["content"].strip()
+        pred_level = parse_response(raw)
+
+        y_true.append(true_level)
+        y_pred.append(pred_level)
+        records.append(
+            {
+                "idx": idx,
+                "true_level": true_level,
+                "pred_level": pred_level,
+                "raw_response": raw,
+                "star_triggered": star_triggered,
+                "query": query,
+            }
+        )
+
+        # 前 5 筆印出 raw response 供驗證
+        if idx < 5:
+            print(f"[{idx + 1}] True={true_level} | Pred={pred_level} | Raw='{raw}'")
+        elif idx % 50 == 0:
+            done = idx + 1
+            pct = done / len(sample) * 100
+            acc_so_far = sum(t == p for t, p in zip(y_true, y_pred) if p != -1) / max(
+                1, sum(p != -1 for p in y_pred)
+            )
+            print(
+                f"Progress: {done}/{len(sample)} ({pct:.1f}%) | Running accuracy: {acc_so_far:.3f}"
+            )
+
+    print(f"\nInference complete. Total: {len(y_true)} samples.")
+
+    # ── 6. 儲存預測結果 ───────────────────────────────────────────────────────
+    suffix = "_full" if FULL_RUN else ""
+    pred_path = os.path.join(RESULTS_DIR, f"predictions{suffix}.csv")
+    pd.DataFrame(records).to_csv(pred_path, index=False, encoding="utf-8-sig")
+    print(f"Predictions saved: {pred_path}")
+
+    # ── 7. 過濾有效預測後計算指標 ─────────────────────────────────────────────
+    valid_pairs = [(t, p) for t, p in zip(y_true, y_pred) if p != -1]
+    if not valid_pairs:
+        print("ERROR: No valid predictions. Check LLM output format.")
+        return
+
+    metrics = compute_metrics(y_true, y_pred)
+
+    # ── 8. 混淆矩陣 ───────────────────────────────────────────────────────────
+    y_true_v = [t for t, p in zip(y_true, y_pred) if p != -1]
+    y_pred_v = [p for p in y_pred if p != -1]
+
+    cm_path = os.path.join(RESULTS_DIR, f"confusion_matrix{suffix}.png")
+    plot_confusion_matrix(y_true_v, y_pred_v, cm_path)
+
+    # ── 9. 文字報告 & 各級 CSV ────────────────────────────────────────────────
+    report_path = os.path.join(RESULTS_DIR, f"metrics_report{suffix}.txt")
+    save_metrics_report(metrics, report_path)
+
+    per_level_path = os.path.join(RESULTS_DIR, f"per_level_metrics{suffix}.csv")
+    save_per_level_csv(metrics, per_level_path)
+
+    print("\n=== All done! Results saved to:", RESULTS_DIR, "===")
+
+
+if __name__ == "__main__":
+    main()
