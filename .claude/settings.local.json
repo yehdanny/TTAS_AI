@@ -10,7 +10,20 @@
       "Bash(/c/Users/ygz08/miniconda3/envs/did_311_1023/python.exe:*)",
       "Bash(/c/Users/ygz08/miniconda3/envs/did_copy_backup1104/python.exe:*)",
       "Bash(\"C:/Users/ygz08/Work/Claude_vibe/place1/TTAS/.venv/Scripts/python.exe\":*)",
-      "Bash(\".venv/Scripts/pip.exe\" install:*)"
+      "Bash(\".venv/Scripts/pip.exe\" install:*)",
+      "Bash(git:*)"
+    ]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "echo '👋 Welcome back! Last commit:' && git log -1 --oneline"
+          }
+        ]
+      }
     ]
   }
 }
