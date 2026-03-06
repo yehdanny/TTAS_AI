@@ -204,12 +204,15 @@ python main.py --full
 | `main_v11.py` | [E] 全面 Vitals Assessment + 雙軌制 (vital_min ∩ LLM); [F] 標注; [G][H] |
 | `main_v12.py` | [I] 依官方 TTAS 成人/兒童標準文件寫死閾值，兒童 HR 依年齡精確分段 |
 | `main_v14.py` ★ | [L] 成人 Temp>38 規則修正（移除假陽性）; [M] MOI 關鍵字偵測第三軌; [N] SYSTEM_SELECTION 提示詞強化; [O] 疼痛分數動態支援 |
+| `main_v15.py` | [P] 三分類實驗（Lv1/Lv2/Lv3+）；Lv3-5 合併評估，驗證疼痛資料缺失為五分類瓶頸 |
 
 ---
 
-## 實驗結果比較（350 筆分層抽樣，各級 70 筆）
+## 實驗結果比較
 
 各版本使用 Qwen3-4B-Instruct GGUF + BGE-M3 嵌入，random_state=42。
+
+### 五分類（350 筆分層抽樣，各級 70 筆）
 
 | 指標 | v1 硬切 | v2 主訴結構化 | v9 EXACT | v10 | v12 官方閾值 | **v14 ★** |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|
@@ -219,7 +222,7 @@ python main.py --full
 
 > v5 僅完成全量推理（9653 筆）：Accuracy 42.77%、Adjacent 94.35%、Kappa 0.2606。v13 因 shock proxy 過鬆導致 Lv1/Lv2 混淆，效果不如 v12，未列入。
 
-### 各級 F1（v12 vs v14）
+### 各級 F1（v12 vs v14，五分類）
 
 | Level | v12 | **v14 ★** | 疼痛驅動案例占比 |
 |---|:---:|:---:|:---:|
@@ -232,6 +235,24 @@ python main.py --full
 > 「疼痛驅動案例」= 該等級中以 TTAS 疼痛標準主訴分類的案例比例（全資料集 9,653 筆統計）。
 > Lv4/Lv5 幾乎全由疼痛程度決定；現有 CSV 無疼痛分數欄位，為 Lv3/Lv4 F1 偏低的主因。
 
+### 三分類實驗（v15，210 筆：Lv1×70 + Lv2×70 + Lv3-5×70）
+
+Lv3/Lv4/Lv5 合併為「Lv3+」，驗證在無疼痛分數情況下模型的真實辨識上限：
+
+| 指標 | v15（三分類） | 說明 |
+|---|:---:|---|
+| **Accuracy** | **77.62%** | 五分類 v14 的 54.57% 大幅提升 |
+| **Adjacent Acc** | **99.52%** | 三類別幾乎無跨級誤差 |
+| **Kappa** | **0.7474** | Substantial → 接近 Almost Perfect |
+
+| Class | F1 |
+|---|:---:|
+| Lv1（復甦急救） | **0.878** |
+| Lv2（危急） | **0.646** |
+| Lv3+（緊急/次緊急/非緊急合計） | **0.789** |
+
+> 三分類準確率從 54.57% 跳升至 77.62%，差距（~23pp）即疼痛資料缺失對五分類造成的天花板損失估計值。補充 NRS 疼痛分數後預期可大幅縮小此差距。
+
 ---
 
 ## 關鍵架構（v7+）
@@ -242,6 +263,10 @@ python main.py --full
     ├─ [Rule-based Vital 軌]
     │      assess_vitals() → VitalAlert 清單
     │      vital_min_level = min(alert.min_level)
+    │
+    ├─ [MOI 關鍵字軌]（v14+）
+    │      detect_moi_level(complaint)
+    │      槍傷/被彈出車外/頭頸軀幹穿刺/大量出血 → moi_level=2
     │
     └─ [LLM RAG 軌]
            EXACT match 主訴名稱
@@ -254,7 +279,7 @@ python main.py --full
            llm_level
     │
     ▼
-final_level = min(vital_min_level, llm_level)
+final_level = min(vital_min_level, moi_level, llm_level)
 ```
 
 ### 官方閾值對照（v14）
